@@ -13,22 +13,21 @@ Uso local:
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
-# --- DEBUG DIRECTO: revisa qué hay en st.secrets sin pasar por config.py ---
-st.write("DEBUG claves en st.secrets:", list(st.secrets.keys()))
-st.write("DEBUG NEON_DB_URL en st.secrets:", "NEON_DB_URL" in st.secrets)
-# --- FIN DEBUG ---
+from config import ACCESS_TOKEN, INSTAGRAM_ACCOUNT_ID, NEON_DB_URL
 
-from config import NEON_DB_URL
+GRAPH_API_VERSION = "v19.0"
+BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
-# --- DEBUG TEMPORAL: quitar después de resolver el problema ---
-st.write("DEBUG NEON_DB_URL es None:", NEON_DB_URL is None)
-st.write("DEBUG tipo:", type(NEON_DB_URL))
-if NEON_DB_URL:
-    st.write("DEBUG primeros 15 caracteres:", NEON_DB_URL[:15])
-# --- FIN DEBUG ---
+METRICS_BY_TYPE = {
+    "IMAGE": ["reach", "saved", "likes", "comments", "shares", "total_interactions"],
+    "CAROUSEL_ALBUM": ["reach", "saved", "likes", "comments", "shares", "total_interactions"],
+    "VIDEO": ["reach", "saved", "likes", "comments", "shares", "total_interactions", "views"],
+    "REEL": ["reach", "saved", "likes", "comments", "shares", "total_interactions", "views"],
+}
 
 st.set_page_config(
     page_title="Instagram Analytics",
@@ -48,6 +47,135 @@ def cargar_datos():
     query = "SELECT * FROM publicaciones_instagram ORDER BY timestamp_publicacion;"
     df = pd.read_sql(query, engine)
     return df
+
+
+def crear_tabla_si_no_existe(engine):
+    ddl = """
+    CREATE TABLE IF NOT EXISTS publicaciones_instagram (
+        media_id            TEXT PRIMARY KEY,
+        cuenta_id            TEXT,
+        media_type           TEXT,
+        caption              TEXT,
+        permalink            TEXT,
+        timestamp_publicacion TIMESTAMPTZ,
+        like_count           INTEGER,
+        comments_count        INTEGER,
+        reach                 INTEGER,
+        saved                 INTEGER,
+        shares                INTEGER,
+        total_interactions    INTEGER,
+        views                 INTEGER,
+        fecha_extraccion     TIMESTAMPTZ DEFAULT now()
+    );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
+def obtener_publicaciones():
+    publicaciones = []
+    url = (
+        f"{BASE_URL}/{INSTAGRAM_ACCOUNT_ID}/media"
+        f"?fields=id,caption,media_type,media_product_type,permalink,timestamp,like_count,comments_count"
+        f"&access_token={ACCESS_TOKEN}"
+    )
+    while url:
+        response = requests.get(url)
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(data["error"]["message"])
+        publicaciones.extend(data.get("data", []))
+        url = data.get("paging", {}).get("next")
+    return publicaciones
+
+
+def obtener_insights(media_id, media_type, media_product_type):
+    tipo_clave = "REEL" if media_product_type == "REELS" else media_type
+    metricas = METRICS_BY_TYPE.get(tipo_clave)
+    if not metricas:
+        return {}
+
+    url = (
+        f"{BASE_URL}/{media_id}/insights"
+        f"?metric={','.join(metricas)}"
+        f"&access_token={ACCESS_TOKEN}"
+    )
+    response = requests.get(url)
+    data = response.json()
+    if "error" in data:
+        return {}
+
+    resultado = {}
+    for item in data.get("data", []):
+        valores = item.get("values", [])
+        if valores:
+            resultado[item["name"]] = valores[0].get("value", 0)
+    return resultado
+
+
+def guardar_publicacion(engine, post, insights):
+    upsert_sql = """
+    INSERT INTO publicaciones_instagram (
+        media_id, cuenta_id, media_type, caption, permalink,
+        timestamp_publicacion, like_count, comments_count,
+        reach, saved, shares, total_interactions, views
+    ) VALUES (
+        :media_id, :cuenta_id, :media_type, :caption, :permalink,
+        :timestamp_publicacion, :like_count, :comments_count,
+        :reach, :saved, :shares, :total_interactions, :views
+    )
+    ON CONFLICT (media_id) DO UPDATE SET
+        like_count = EXCLUDED.like_count,
+        comments_count = EXCLUDED.comments_count,
+        reach = EXCLUDED.reach,
+        saved = EXCLUDED.saved,
+        shares = EXCLUDED.shares,
+        total_interactions = EXCLUDED.total_interactions,
+        views = EXCLUDED.views,
+        fecha_extraccion = now();
+    """
+    with engine.begin() as conn:
+        conn.execute(text(upsert_sql), {
+            "media_id": post["id"],
+            "cuenta_id": INSTAGRAM_ACCOUNT_ID,
+            "media_type": post.get("media_type"),
+            "caption": post.get("caption"),
+            "permalink": post.get("permalink"),
+            "timestamp_publicacion": post.get("timestamp"),
+            "like_count": post.get("like_count", 0),
+            "comments_count": post.get("comments_count", 0),
+            "reach": insights.get("reach"),
+            "saved": insights.get("saved"),
+            "shares": insights.get("shares"),
+            "total_interactions": insights.get("total_interactions"),
+            "views": insights.get("views"),
+        })
+
+
+def refrescar_datos_instagram():
+    """Descarga publicaciones nuevas de Instagram y actualiza Postgres.
+    Devuelve (exito: bool, mensaje: str)."""
+    if not ACCESS_TOKEN or not INSTAGRAM_ACCOUNT_ID:
+        return False, "Falta ACCESS_TOKEN o INSTAGRAM_ACCOUNT_ID en Secrets."
+
+    engine = get_engine()
+    crear_tabla_si_no_existe(engine)
+
+    try:
+        publicaciones = obtener_publicaciones()
+    except RuntimeError as e:
+        return False, f"Error de la API de Meta: {e}"
+
+    if not publicaciones:
+        return True, "No se encontraron publicaciones nuevas."
+
+    for post in publicaciones:
+        insights = obtener_insights(
+            post["id"], post.get("media_type"), post.get("media_product_type")
+        )
+        guardar_publicacion(engine, post, insights)
+
+    return True, f"{len(publicaciones)} publicaciones actualizadas correctamente."
 
 
 def preparar_datos(df):
@@ -76,17 +204,30 @@ def main():
     st.title("📸 Instagram Analytics Dashboard")
     st.caption("Análisis de interacción y desempeño de publicaciones")
 
+    # ---- Botón de refrescar (siempre visible, incluso sin datos aún) ----
+    st.sidebar.header("Filtros")
+
+    if st.sidebar.button("🔄 Refrescar datos de Instagram", width="stretch"):
+        with st.spinner("Descargando publicaciones desde Instagram..."):
+            exito, mensaje = refrescar_datos_instagram()
+        if exito:
+            st.sidebar.success(mensaje)
+            st.cache_data.clear()  # invalida la caché para recargar los datos nuevos
+            st.rerun()
+        else:
+            st.sidebar.error(mensaje)
+
+    st.sidebar.divider()
+
     df = cargar_datos()
 
     if df.empty:
-        st.warning("⚠️ No hay publicaciones en la base de datos todavía. Corre `02_extraer_posts.py` primero.")
+        st.warning("⚠️ No hay publicaciones en la base de datos todavía. Usa el botón de refrescar en la barra lateral, o corre `02_extraer_posts.py` localmente.")
         return
 
     df = preparar_datos(df)
 
-    # ---- Filtros en la barra lateral ----
-    st.sidebar.header("Filtros")
-
+    # ---- Filtros adicionales en la barra lateral ----
     tipos_disponibles = sorted(df["media_type"].unique().tolist())
     tipos_seleccionados = st.sidebar.multiselect(
         "Tipo de contenido", tipos_disponibles, default=tipos_disponibles
