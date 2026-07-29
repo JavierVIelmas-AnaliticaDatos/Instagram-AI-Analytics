@@ -18,6 +18,13 @@ from sqlalchemy import create_engine
 
 from config import NEON_DB_URL
 
+# --- DEBUG TEMPORAL: quitar después de resolver el problema ---
+st.write("DEBUG NEON_DB_URL es None:", NEON_DB_URL is None)
+st.write("DEBUG tipo:", type(NEON_DB_URL))
+if NEON_DB_URL:
+    st.write("DEBUG primeros 15 caracteres:", NEON_DB_URL[:15])
+# --- FIN DEBUG ---
+
 st.set_page_config(
     page_title="Instagram Analytics",
     page_icon="📸",
