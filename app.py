@@ -16,6 +16,11 @@ import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine
 
+# --- DEBUG DIRECTO: revisa qué hay en st.secrets sin pasar por config.py ---
+st.write("DEBUG claves en st.secrets:", list(st.secrets.keys()))
+st.write("DEBUG NEON_DB_URL en st.secrets:", "NEON_DB_URL" in st.secrets)
+# --- FIN DEBUG ---
+
 from config import NEON_DB_URL
 
 # --- DEBUG TEMPORAL: quitar después de resolver el problema ---
