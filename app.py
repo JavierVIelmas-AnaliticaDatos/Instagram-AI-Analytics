@@ -4,6 +4,10 @@ app.py
 Dashboard de analítica de Instagram: visualiza engagement, alcance y
 desempeño por tipo de contenido a partir de los datos guardados en Postgres (Neon).
 
+Soporta múltiples cuentas de Instagram: las credenciales (nombre, access_token,
+instagram_account_id) se guardan en la tabla 'cuentas_instagram' y se seleccionan
+desde un dropdown en la barra lateral.
+
 Requiere en .env / Streamlit secrets:
     NEON_DB_URL
 
@@ -17,7 +21,7 @@ import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-from config import ACCESS_TOKEN, INSTAGRAM_ACCOUNT_ID, NEON_DB_URL
+from config import NEON_DB_URL
 
 GRAPH_API_VERSION = "v19.0"
 BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -41,43 +45,83 @@ def get_engine():
     return create_engine(NEON_DB_URL)
 
 
-@st.cache_data(ttl=300)  # refresca cada 5 minutos
-def cargar_datos():
-    engine = get_engine()
-    query = "SELECT * FROM publicaciones_instagram ORDER BY timestamp_publicacion;"
-    df = pd.read_sql(query, engine)
-    return df
+# ---------------------------------------------------------------------------
+# Gestión de cuentas (multi-cuenta)
+# ---------------------------------------------------------------------------
 
-
-def crear_tabla_si_no_existe(engine):
-    ddl = """
+def crear_tablas_si_no_existen(engine):
+    ddl_cuentas = """
+    CREATE TABLE IF NOT EXISTS cuentas_instagram (
+        id                    SERIAL PRIMARY KEY,
+        nombre                TEXT UNIQUE NOT NULL,
+        access_token          TEXT NOT NULL,
+        instagram_account_id  TEXT NOT NULL,
+        fecha_creacion        TIMESTAMPTZ DEFAULT now()
+    );
+    """
+    ddl_publicaciones = """
     CREATE TABLE IF NOT EXISTS publicaciones_instagram (
-        media_id            TEXT PRIMARY KEY,
-        cuenta_id            TEXT,
-        media_type           TEXT,
-        caption              TEXT,
-        permalink            TEXT,
+        media_id              TEXT PRIMARY KEY,
+        cuenta_id             TEXT,
+        media_type            TEXT,
+        caption               TEXT,
+        permalink             TEXT,
         timestamp_publicacion TIMESTAMPTZ,
-        like_count           INTEGER,
+        like_count            INTEGER,
         comments_count        INTEGER,
         reach                 INTEGER,
         saved                 INTEGER,
         shares                INTEGER,
         total_interactions    INTEGER,
         views                 INTEGER,
-        fecha_extraccion     TIMESTAMPTZ DEFAULT now()
+        fecha_extraccion      TIMESTAMPTZ DEFAULT now()
     );
     """
     with engine.begin() as conn:
-        conn.execute(text(ddl))
+        conn.execute(text(ddl_cuentas))
+        conn.execute(text(ddl_publicaciones))
 
 
-def obtener_publicaciones():
+@st.cache_data(ttl=60)
+def cargar_cuentas():
+    engine = get_engine()
+    query = "SELECT id, nombre, access_token, instagram_account_id FROM cuentas_instagram ORDER BY nombre;"
+    return pd.read_sql(query, engine)
+
+
+def guardar_cuenta(nombre, access_token, instagram_account_id):
+    engine = get_engine()
+    upsert_sql = """
+    INSERT INTO cuentas_instagram (nombre, access_token, instagram_account_id)
+    VALUES (:nombre, :access_token, :instagram_account_id)
+    ON CONFLICT (nombre) DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        instagram_account_id = EXCLUDED.instagram_account_id;
+    """
+    with engine.begin() as conn:
+        conn.execute(text(upsert_sql), {
+            "nombre": nombre,
+            "access_token": access_token,
+            "instagram_account_id": instagram_account_id,
+        })
+
+
+def eliminar_cuenta(nombre):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM cuentas_instagram WHERE nombre = :nombre"), {"nombre": nombre})
+
+
+# ---------------------------------------------------------------------------
+# Extracción desde Meta Graph API
+# ---------------------------------------------------------------------------
+
+def obtener_publicaciones(access_token, instagram_account_id):
     publicaciones = []
     url = (
-        f"{BASE_URL}/{INSTAGRAM_ACCOUNT_ID}/media"
+        f"{BASE_URL}/{instagram_account_id}/media"
         f"?fields=id,caption,media_type,media_product_type,permalink,timestamp,like_count,comments_count"
-        f"&access_token={ACCESS_TOKEN}"
+        f"&access_token={access_token}"
     )
     while url:
         response = requests.get(url)
@@ -89,7 +133,7 @@ def obtener_publicaciones():
     return publicaciones
 
 
-def obtener_insights(media_id, media_type, media_product_type):
+def obtener_insights(media_id, media_type, media_product_type, access_token):
     tipo_clave = "REEL" if media_product_type == "REELS" else media_type
     metricas = METRICS_BY_TYPE.get(tipo_clave)
     if not metricas:
@@ -98,7 +142,7 @@ def obtener_insights(media_id, media_type, media_product_type):
     url = (
         f"{BASE_URL}/{media_id}/insights"
         f"?metric={','.join(metricas)}"
-        f"&access_token={ACCESS_TOKEN}"
+        f"&access_token={access_token}"
     )
     response = requests.get(url)
     data = response.json()
@@ -113,7 +157,7 @@ def obtener_insights(media_id, media_type, media_product_type):
     return resultado
 
 
-def guardar_publicacion(engine, post, insights):
+def guardar_publicacion(engine, post, insights, instagram_account_id):
     upsert_sql = """
     INSERT INTO publicaciones_instagram (
         media_id, cuenta_id, media_type, caption, permalink,
@@ -137,7 +181,7 @@ def guardar_publicacion(engine, post, insights):
     with engine.begin() as conn:
         conn.execute(text(upsert_sql), {
             "media_id": post["id"],
-            "cuenta_id": INSTAGRAM_ACCOUNT_ID,
+            "cuenta_id": instagram_account_id,
             "media_type": post.get("media_type"),
             "caption": post.get("caption"),
             "permalink": post.get("permalink"),
@@ -152,17 +196,16 @@ def guardar_publicacion(engine, post, insights):
         })
 
 
-def refrescar_datos_instagram():
+def refrescar_datos_instagram(access_token, instagram_account_id):
     """Descarga publicaciones nuevas de Instagram y actualiza Postgres.
     Devuelve (exito: bool, mensaje: str)."""
-    if not ACCESS_TOKEN or not INSTAGRAM_ACCOUNT_ID:
-        return False, "Falta ACCESS_TOKEN o INSTAGRAM_ACCOUNT_ID en Secrets."
+    if not access_token or not instagram_account_id:
+        return False, "Falta el token o el ID de cuenta de Instagram."
 
     engine = get_engine()
-    crear_tabla_si_no_existe(engine)
 
     try:
-        publicaciones = obtener_publicaciones()
+        publicaciones = obtener_publicaciones(access_token, instagram_account_id)
     except RuntimeError as e:
         return False, f"Error de la API de Meta: {e}"
 
@@ -171,11 +214,23 @@ def refrescar_datos_instagram():
 
     for post in publicaciones:
         insights = obtener_insights(
-            post["id"], post.get("media_type"), post.get("media_product_type")
+            post["id"], post.get("media_type"), post.get("media_product_type"), access_token
         )
-        guardar_publicacion(engine, post, insights)
+        guardar_publicacion(engine, post, insights, instagram_account_id)
 
     return True, f"{len(publicaciones)} publicaciones actualizadas correctamente."
+
+
+# ---------------------------------------------------------------------------
+# Datos y analítica
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300)
+def cargar_datos(instagram_account_id):
+    engine = get_engine()
+    query = "SELECT * FROM publicaciones_instagram WHERE cuenta_id = :cuenta_id ORDER BY timestamp_publicacion;"
+    df = pd.read_sql(text(query), engine, params={"cuenta_id": instagram_account_id})
+    return df
 
 
 def preparar_datos(df):
@@ -200,34 +255,97 @@ def preparar_datos(df):
     return df
 
 
+# ---------------------------------------------------------------------------
+# Selector de cuenta en la barra lateral
+# ---------------------------------------------------------------------------
+
+def selector_de_cuenta():
+    st.sidebar.header("Cuenta de Instagram")
+
+    cuentas_df = cargar_cuentas()
+
+    opciones = cuentas_df["nombre"].tolist() + ["➕ Agregar nueva cuenta..."]
+    seleccion = st.sidebar.selectbox("Selecciona una cuenta", opciones)
+
+    if seleccion == "➕ Agregar nueva cuenta...":
+        with st.sidebar.form("form_nueva_cuenta"):
+            st.write("**Nueva cuenta**")
+            nombre = st.text_input("Nombre para identificarla (ej. 'Cliente A')")
+            token = st.text_input("Access Token", type="password")
+            account_id = st.text_input("Instagram Account ID")
+            guardar = st.form_submit_button("💾 Guardar cuenta")
+
+        if guardar:
+            if not nombre or not token or not account_id:
+                st.sidebar.error("Completa los tres campos.")
+                return None
+            guardar_cuenta(nombre, token, account_id)
+            st.cache_data.clear()
+            st.sidebar.success(f"Cuenta '{nombre}' guardada.")
+            st.rerun()
+
+        return None
+
+    fila = cuentas_df[cuentas_df["nombre"] == seleccion].iloc[0]
+
+    with st.sidebar.expander("⚙️ Gestionar esta cuenta"):
+        st.caption(f"Instagram Account ID: {fila['instagram_account_id']}")
+        if st.button("🗑️ Eliminar esta cuenta", width="stretch"):
+            eliminar_cuenta(seleccion)
+            st.cache_data.clear()
+            st.rerun()
+
+    return {
+        "nombre": fila["nombre"],
+        "access_token": fila["access_token"],
+        "instagram_account_id": fila["instagram_account_id"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# App principal
+# ---------------------------------------------------------------------------
+
 def main():
     st.title("📸 Instagram Analytics Dashboard")
     st.caption("Análisis de interacción y desempeño de publicaciones")
 
-    # ---- Botón de refrescar (siempre visible, incluso sin datos aún) ----
-    st.sidebar.header("Filtros")
+    engine = get_engine()
+    crear_tablas_si_no_existen(engine)
+
+    cuenta = selector_de_cuenta()
+
+    if cuenta is None:
+        st.info("👈 Selecciona o agrega una cuenta de Instagram en la barra lateral para comenzar.")
+        return
+
+    st.sidebar.divider()
 
     if st.sidebar.button("🔄 Refrescar datos de Instagram", width="stretch"):
-        with st.spinner("Descargando publicaciones desde Instagram..."):
-            exito, mensaje = refrescar_datos_instagram()
+        with st.spinner(f"Descargando publicaciones de '{cuenta['nombre']}'..."):
+            exito, mensaje = refrescar_datos_instagram(
+                cuenta["access_token"], cuenta["instagram_account_id"]
+            )
         if exito:
             st.sidebar.success(mensaje)
-            st.cache_data.clear()  # invalida la caché para recargar los datos nuevos
+            st.cache_data.clear()
             st.rerun()
         else:
             st.sidebar.error(mensaje)
 
     st.sidebar.divider()
 
-    df = cargar_datos()
+    df = cargar_datos(cuenta["instagram_account_id"])
 
     if df.empty:
-        st.warning("⚠️ No hay publicaciones en la base de datos todavía. Usa el botón de refrescar en la barra lateral, o corre `02_extraer_posts.py` localmente.")
+        st.warning("⚠️ No hay publicaciones para esta cuenta todavía. Usa el botón de refrescar en la barra lateral.")
         return
 
     df = preparar_datos(df)
 
-    # ---- Filtros adicionales en la barra lateral ----
+    # ---- Filtros adicionales ----
+    st.sidebar.header("Filtros")
+
     tipos_disponibles = sorted(df["media_type"].unique().tolist())
     tipos_seleccionados = st.sidebar.multiselect(
         "Tipo de contenido", tipos_disponibles, default=tipos_disponibles
@@ -332,4 +450,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     
