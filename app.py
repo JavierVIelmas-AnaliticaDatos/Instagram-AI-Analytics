@@ -15,6 +15,8 @@ Uso local:
     streamlit run app.py
 """
 
+import re
+
 import pandas as pd
 import plotly.express as px
 import requests
@@ -56,6 +58,7 @@ def crear_tablas_si_no_existen(engine):
         nombre                TEXT UNIQUE NOT NULL,
         access_token          TEXT NOT NULL,
         instagram_account_id  TEXT NOT NULL,
+        followers_count       INTEGER,
         fecha_creacion        TIMESTAMPTZ DEFAULT now()
     );
     """
@@ -80,12 +83,14 @@ def crear_tablas_si_no_existen(engine):
     with engine.begin() as conn:
         conn.execute(text(ddl_cuentas))
         conn.execute(text(ddl_publicaciones))
+        # Migración: agrega followers_count si la tabla ya existía de una versión anterior
+        conn.execute(text("ALTER TABLE cuentas_instagram ADD COLUMN IF NOT EXISTS followers_count INTEGER;"))
 
 
 @st.cache_data(ttl=60)
 def cargar_cuentas():
     engine = get_engine()
-    query = "SELECT id, nombre, access_token, instagram_account_id FROM cuentas_instagram ORDER BY nombre;"
+    query = "SELECT id, nombre, access_token, instagram_account_id, followers_count FROM cuentas_instagram ORDER BY nombre;"
     return pd.read_sql(query, engine)
 
 
@@ -115,6 +120,24 @@ def eliminar_cuenta(nombre):
 # ---------------------------------------------------------------------------
 # Extracción desde Meta Graph API
 # ---------------------------------------------------------------------------
+
+def obtener_followers_count(access_token, instagram_account_id):
+    url = f"{BASE_URL}/{instagram_account_id}?fields=followers_count&access_token={access_token}"
+    response = requests.get(url)
+    data = response.json()
+    if "error" in data:
+        return None
+    return data.get("followers_count")
+
+
+def actualizar_followers_count(nombre, followers_count):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE cuentas_instagram SET followers_count = :fc WHERE nombre = :nombre"),
+            {"fc": followers_count, "nombre": nombre},
+        )
+
 
 def obtener_publicaciones(access_token, instagram_account_id):
     publicaciones = []
@@ -196,13 +219,17 @@ def guardar_publicacion(engine, post, insights, instagram_account_id):
         })
 
 
-def refrescar_datos_instagram(access_token, instagram_account_id):
+def refrescar_datos_instagram(nombre_cuenta, access_token, instagram_account_id):
     """Descarga publicaciones nuevas de Instagram y actualiza Postgres.
     Devuelve (exito: bool, mensaje: str)."""
     if not access_token or not instagram_account_id:
         return False, "Falta el token o el ID de cuenta de Instagram."
 
     engine = get_engine()
+
+    followers_count = obtener_followers_count(access_token, instagram_account_id)
+    if followers_count is not None:
+        actualizar_followers_count(nombre_cuenta, followers_count)
 
     try:
         publicaciones = obtener_publicaciones(access_token, instagram_account_id)
@@ -233,7 +260,7 @@ def cargar_datos(instagram_account_id):
     return df
 
 
-def preparar_datos(df):
+def preparar_datos(df, followers_count=None):
     df["timestamp_publicacion"] = pd.to_datetime(df["timestamp_publicacion"])
     df["fecha"] = df["timestamp_publicacion"].dt.date
     df["dia_semana"] = df["timestamp_publicacion"].dt.day_name()
@@ -246,11 +273,27 @@ def preparar_datos(df):
     for col in columnas_numericas:
         df[col] = df[col].fillna(0)
 
+    # Engagement rate basado en reach (como antes) — sensible al alcance puntual del post
     df["engagement_rate_pct"] = df.apply(
         lambda row: round((row["total_interactions"] / row["reach"]) * 100, 2)
         if row["reach"] > 0 else 0,
         axis=1,
     )
+
+    # Engagement rate basado en seguidores — métrica estándar de la industria,
+    # más estable porque no depende de las fluctuaciones del algoritmo en el reach.
+    if followers_count and followers_count > 0:
+        df["engagement_rate_followers_pct"] = round(
+            (df["total_interactions"] / followers_count) * 100, 2
+        )
+    else:
+        df["engagement_rate_followers_pct"] = None
+
+    # --- Análisis de contenido: caption y hashtags ---
+    df["caption"] = df["caption"].fillna("")
+    df["caption_length"] = df["caption"].str.len()
+    df["hashtags"] = df["caption"].apply(lambda c: re.findall(r"#(\w+)", c))
+    df["num_hashtags"] = df["hashtags"].apply(len)
 
     return df
 
@@ -299,6 +342,7 @@ def selector_de_cuenta():
         "nombre": fila["nombre"],
         "access_token": fila["access_token"],
         "instagram_account_id": fila["instagram_account_id"],
+        "followers_count": fila["followers_count"],
     }
 
 
@@ -324,7 +368,7 @@ def main():
     if st.sidebar.button("🔄 Refrescar datos de Instagram", width="stretch"):
         with st.spinner(f"Descargando publicaciones de '{cuenta['nombre']}'..."):
             exito, mensaje = refrescar_datos_instagram(
-                cuenta["access_token"], cuenta["instagram_account_id"]
+                cuenta["nombre"], cuenta["access_token"], cuenta["instagram_account_id"]
             )
         if exito:
             st.sidebar.success(mensaje)
@@ -341,7 +385,7 @@ def main():
         st.warning("⚠️ No hay publicaciones para esta cuenta todavía. Usa el botón de refrescar en la barra lateral.")
         return
 
-    df = preparar_datos(df)
+    df = preparar_datos(df, followers_count=cuenta["followers_count"])
 
     # ---- Filtros adicionales ----
     st.sidebar.header("Filtros")
@@ -367,12 +411,23 @@ def main():
         return
 
     # ---- KPIs principales ----
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Publicaciones", len(df_filtrado))
-    col2.metric("Likes promedio", f"{df_filtrado['like_count'].mean():.1f}")
-    col3.metric("Comentarios promedio", f"{df_filtrado['comments_count'].mean():.1f}")
+    col2.metric("Seguidores", f"{cuenta['followers_count']:,}" if cuenta["followers_count"] else "—")
+    col3.metric("Likes promedio", f"{df_filtrado['like_count'].mean():.1f}")
     col4.metric("Reach promedio", f"{df_filtrado['reach'].mean():.1f}")
-    col5.metric("Engagement promedio", f"{df_filtrado['engagement_rate_pct'].mean():.1f}%")
+    col5.metric("Engagement / reach", f"{df_filtrado['engagement_rate_pct'].mean():.1f}%")
+    if df_filtrado["engagement_rate_followers_pct"].notna().any():
+        col6.metric("Engagement / seguidores", f"{df_filtrado['engagement_rate_followers_pct'].mean():.2f}%")
+    else:
+        col6.metric("Engagement / seguidores", "—")
+
+    st.caption(
+        "💡 **Engagement / reach**: interacciones sobre el alcance de cada post (sensible a "
+        "fluctuaciones del algoritmo). **Engagement / seguidores**: interacciones sobre el total "
+        "de seguidores actuales — métrica estándar de la industria, más estable para comparar "
+        "publicaciones entre sí."
+    )
 
     st.divider()
 
@@ -436,11 +491,53 @@ def main():
         )
         st.plotly_chart(fig_hora, width="stretch")
 
+    # ---- Análisis de contenido: hashtags y longitud de caption ----
+    st.subheader("Análisis de contenido")
+    col_hash, col_caption = st.columns(2)
+
+    with col_hash:
+        st.markdown("**Hashtags más usados y su engagement promedio**")
+        hashtags_expandidos = df_filtrado.explode("hashtags").dropna(subset=["hashtags"])
+        if hashtags_expandidos.empty:
+            st.info("No se detectaron hashtags en las publicaciones filtradas.")
+        else:
+            resumen_hashtags = (
+                hashtags_expandidos.groupby("hashtags")
+                .agg(usos=("media_id", "count"), engagement_promedio=("engagement_rate_pct", "mean"))
+                .sort_values("usos", ascending=False)
+                .head(10)
+                .round(2)
+            )
+            st.dataframe(resumen_hashtags, width="stretch")
+
+    with col_caption:
+        st.markdown("**Longitud del caption vs. engagement**")
+        if df_filtrado["caption_length"].sum() == 0:
+            st.info("Las publicaciones filtradas no tienen texto en el caption.")
+        else:
+            fig_caption = px.scatter(
+                df_filtrado,
+                x="caption_length",
+                y="engagement_rate_pct",
+                color="media_type",
+                size="num_hashtags",
+                hover_data=["permalink"],
+                labels={
+                    "caption_length": "Longitud del caption (caracteres)",
+                    "engagement_rate_pct": "Engagement (%)",
+                    "num_hashtags": "N° hashtags",
+                },
+            )
+            st.plotly_chart(fig_caption, width="stretch")
+
+    st.divider()
+
     # ---- Tabla de publicaciones ----
     st.subheader("Detalle de publicaciones")
     columnas_tabla = [
         "timestamp_publicacion", "media_type", "like_count", "comments_count",
-        "reach", "views", "total_interactions", "engagement_rate_pct", "permalink",
+        "reach", "views", "total_interactions", "engagement_rate_pct",
+        "num_hashtags", "caption_length", "permalink",
     ]
     st.dataframe(
         df_filtrado[columnas_tabla].sort_values("timestamp_publicacion", ascending=False),
@@ -451,4 +548,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
