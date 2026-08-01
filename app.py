@@ -16,9 +16,12 @@ Uso local:
 """
 
 import re
+from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
@@ -80,9 +83,18 @@ def crear_tablas_si_no_existen(engine):
         fecha_extraccion      TIMESTAMPTZ DEFAULT now()
     );
     """
+    ddl_historial_seguidores = """
+    CREATE TABLE IF NOT EXISTS historial_seguidores (
+        cuenta_id       TEXT NOT NULL,
+        fecha           DATE NOT NULL,
+        followers_count INTEGER,
+        PRIMARY KEY (cuenta_id, fecha)
+    );
+    """
     with engine.begin() as conn:
         conn.execute(text(ddl_cuentas))
         conn.execute(text(ddl_publicaciones))
+        conn.execute(text(ddl_historial_seguidores))
         # Migración: agrega followers_count si la tabla ya existía de una versión anterior
         conn.execute(text("ALTER TABLE cuentas_instagram ADD COLUMN IF NOT EXISTS followers_count INTEGER;"))
 
@@ -130,13 +142,84 @@ def obtener_followers_count(access_token, instagram_account_id):
     return data.get("followers_count")
 
 
-def actualizar_followers_count(nombre, followers_count):
+def actualizar_followers_count(nombre, instagram_account_id, followers_count):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE cuentas_instagram SET followers_count = :fc WHERE nombre = :nombre"),
             {"fc": followers_count, "nombre": nombre},
         )
+        # Guarda un snapshot histórico (uno por día; si ya existe uno hoy, lo actualiza)
+        conn.execute(
+            text("""
+                INSERT INTO historial_seguidores (cuenta_id, fecha, followers_count)
+                VALUES (:cuenta_id, CURRENT_DATE, :fc)
+                ON CONFLICT (cuenta_id, fecha) DO UPDATE SET followers_count = EXCLUDED.followers_count;
+            """),
+            {"cuenta_id": instagram_account_id, "fc": followers_count},
+        )
+
+
+@st.cache_data(ttl=300)
+def cargar_historial_seguidores(instagram_account_id):
+    engine = get_engine()
+    query = "SELECT fecha, followers_count FROM historial_seguidores WHERE cuenta_id = :cuenta_id ORDER BY fecha;"
+    return pd.read_sql(text(query), engine, params={"cuenta_id": instagram_account_id})
+
+
+def obtener_historial_seguidores_api(access_token, instagram_account_id, dias=30):
+    """Trae la serie histórica de follower_count de los últimos N días desde Meta.
+    Meta solo retiene esta métrica por un período limitado (~30 días), por eso
+    conviene hacer este backfill lo antes posible al conectar una cuenta nueva."""
+    until = datetime.now()
+    since = until - timedelta(days=dias)
+
+    url = (
+        f"{BASE_URL}/{instagram_account_id}/insights"
+        f"?metric=follower_count&period=day&metric_type=time_series"
+        f"&since={int(since.timestamp())}&until={int(until.timestamp())}"
+        f"&access_token={access_token}"
+    )
+    response = requests.get(url)
+    data = response.json()
+
+    if "error" in data:
+        return None, data["error"]["message"]
+
+    resultados = data.get("data", [])
+    if not resultados:
+        return [], None
+
+    valores = resultados[0].get("values", [])
+    serie = []
+    for punto in valores:
+        fecha = punto["end_time"][:10]  # "2026-07-01T07:00:00+0000" -> "2026-07-01"
+        serie.append({"fecha": fecha, "followers_count": punto["value"]})
+
+    return serie, None
+
+
+def guardar_historial_seguidores_bulk(instagram_account_id, serie):
+    """Inserta/actualiza varios puntos históricos de una sola vez.
+    Usa ON CONFLICT DO UPDATE, así que NUNCA borra registros existentes —
+    solo llena huecos o corrige el valor de un día si ya existía."""
+    if not serie:
+        return 0
+
+    engine = get_engine()
+    upsert_sql = """
+        INSERT INTO historial_seguidores (cuenta_id, fecha, followers_count)
+        VALUES (:cuenta_id, :fecha, :followers_count)
+        ON CONFLICT (cuenta_id, fecha) DO UPDATE SET followers_count = EXCLUDED.followers_count;
+    """
+    with engine.begin() as conn:
+        for punto in serie:
+            conn.execute(text(upsert_sql), {
+                "cuenta_id": instagram_account_id,
+                "fecha": punto["fecha"],
+                "followers_count": punto["followers_count"],
+            })
+    return len(serie)
 
 
 def obtener_publicaciones(access_token, instagram_account_id):
@@ -229,7 +312,7 @@ def refrescar_datos_instagram(nombre_cuenta, access_token, instagram_account_id)
 
     followers_count = obtener_followers_count(access_token, instagram_account_id)
     if followers_count is not None:
-        actualizar_followers_count(nombre_cuenta, followers_count)
+        actualizar_followers_count(nombre_cuenta, instagram_account_id, followers_count)
 
     try:
         publicaciones = obtener_publicaciones(access_token, instagram_account_id)
@@ -265,6 +348,7 @@ def preparar_datos(df, followers_count=None):
     df["fecha"] = df["timestamp_publicacion"].dt.date
     df["dia_semana"] = df["timestamp_publicacion"].dt.day_name()
     df["hora_publicacion"] = df["timestamp_publicacion"].dt.hour
+    df["mes_anio"] = df["timestamp_publicacion"].dt.to_period("M").astype(str)
 
     columnas_numericas = [
         "like_count", "comments_count", "reach",
@@ -323,8 +407,16 @@ def selector_de_cuenta():
                 st.sidebar.error("Completa los tres campos.")
                 return None
             guardar_cuenta(nombre, token, account_id)
+
+            with st.spinner("Cargando historial de seguidores de los últimos 30 días..."):
+                serie, error = obtener_historial_seguidores_api(token, account_id)
+            if error:
+                st.sidebar.warning(f"Cuenta guardada, pero no se pudo cargar el historial: {error}")
+            else:
+                n = guardar_historial_seguidores_bulk(account_id, serie)
+                st.sidebar.success(f"Cuenta '{nombre}' guardada, con {n} días de historial cargados.")
+
             st.cache_data.clear()
-            st.sidebar.success(f"Cuenta '{nombre}' guardada.")
             st.rerun()
 
         return None
@@ -333,6 +425,20 @@ def selector_de_cuenta():
 
     with st.sidebar.expander("⚙️ Gestionar esta cuenta"):
         st.caption(f"Instagram Account ID: {fila['instagram_account_id']}")
+
+        if st.button("📥 Cargar historial de seguidores (30 días)", width="stretch"):
+            with st.spinner("Consultando historial en Meta..."):
+                serie, error = obtener_historial_seguidores_api(
+                    fila["access_token"], fila["instagram_account_id"]
+                )
+            if error:
+                st.error(f"No se pudo cargar el historial: {error}")
+            else:
+                n = guardar_historial_seguidores_bulk(fila["instagram_account_id"], serie)
+                st.success(f"{n} días de historial cargados/actualizados.")
+                st.cache_data.clear()
+                st.rerun()
+
         if st.button("🗑️ Eliminar esta cuenta", width="stretch"):
             eliminar_cuenta(seleccion)
             st.cache_data.clear()
@@ -428,6 +534,135 @@ def main():
         "de seguidores actuales — métrica estándar de la industria, más estable para comparar "
         "publicaciones entre sí."
     )
+
+    st.divider()
+
+    # ---- Crecimiento de seguidores en el tiempo ----
+    st.subheader("📈 Crecimiento de la cuenta")
+    historial = cargar_historial_seguidores(cuenta["instagram_account_id"])
+
+    if len(historial) < 2:
+        st.info(
+            "Aún no hay suficiente historial para graficar el crecimiento. "
+            "Cada vez que uses '🔄 Refrescar datos' se guarda un registro nuevo — "
+            "con el tiempo este gráfico mostrará la evolución real de seguidores."
+        )
+    else:
+        fig_seguidores = px.line(
+            historial, x="fecha", y="followers_count", markers=True,
+            labels={"fecha": "Fecha", "followers_count": "Seguidores"},
+        )
+        st.plotly_chart(fig_seguidores, width="stretch")
+
+    # ---- Publicaciones vs. cambio de seguidores por día (correlación, no causalidad) ----
+    if len(historial) >= 2:
+        st.subheader("📊 Publicaciones vs. cambio de seguidores")
+        st.caption(
+            "⚠️ Meta no permite atribuir el crecimiento de seguidores a una publicación "
+            "específica. Este gráfico muestra ambas series en el mismo día para detectar "
+            "**correlaciones visuales** (no causalidad comprobada) — útil como pista, no como prueba."
+        )
+
+        historial_calc = historial.copy()
+        historial_calc["fecha"] = pd.to_datetime(historial_calc["fecha"]).dt.date
+        historial_calc["cambio_neto"] = historial_calc["followers_count"].diff()
+
+        posts_por_dia = df_filtrado.groupby("fecha", as_index=False).size().rename(columns={"size": "publicaciones"})
+
+        fig_combinado = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_combinado.add_trace(
+            go.Bar(x=posts_por_dia["fecha"], y=posts_por_dia["publicaciones"], name="Publicaciones"),
+            secondary_y=False,
+        )
+        fig_combinado.add_trace(
+            go.Scatter(
+                x=historial_calc["fecha"], y=historial_calc["cambio_neto"],
+                name="Cambio neto de seguidores", mode="lines+markers",
+            ),
+            secondary_y=True,
+        )
+        fig_combinado.update_yaxes(title_text="N° publicaciones", secondary_y=False)
+        fig_combinado.update_yaxes(title_text="Cambio neto de seguidores", secondary_y=True)
+        st.plotly_chart(fig_combinado, width="stretch")
+
+    st.divider()
+
+    # ---- Frecuencia de publicación ----
+    fechas_ordenadas = df_filtrado["timestamp_publicacion"].sort_values()
+    if len(fechas_ordenadas) >= 2:
+        dias_entre_posts = fechas_ordenadas.diff().dt.total_seconds().dropna() / 86400
+        promedio_dias = dias_entre_posts.mean()
+        col_freq1, col_freq2 = st.columns(2)
+        col_freq1.metric("Días promedio entre publicaciones", f"{promedio_dias:.1f}")
+        col_freq2.metric("Publicaciones por semana (aprox.)", f"{7 / promedio_dias:.1f}" if promedio_dias > 0 else "—")
+
+    st.divider()
+
+    # ---- Comparación mensual ----
+    st.subheader("📅 Comparación mes a mes")
+    meses_disponibles = df_filtrado["mes_anio"].nunique()
+    if meses_disponibles < 2:
+        st.info(
+            f"Todas las publicaciones filtradas caen en el mismo mes ({df_filtrado['mes_anio'].iloc[0]}). "
+            "Cuando tengas publicaciones de varios meses, aquí verás la comparación de desempeño entre ellos."
+        )
+    else:
+        resumen_mensual = df_filtrado.groupby("mes_anio", as_index=False).agg(
+            publicaciones=("media_id", "count"),
+            likes_promedio=("like_count", "mean"),
+            reach_promedio=("reach", "mean"),
+            engagement_promedio=("engagement_rate_pct", "mean"),
+        ).round(2)
+
+        col_mes1, col_mes2 = st.columns(2)
+        with col_mes1:
+            fig_mes_posts = px.bar(
+                resumen_mensual, x="mes_anio", y="publicaciones",
+                labels={"mes_anio": "Mes", "publicaciones": "N° publicaciones"},
+                title="Publicaciones por mes",
+            )
+            st.plotly_chart(fig_mes_posts, width="stretch")
+        with col_mes2:
+            fig_mes_eng = px.bar(
+                resumen_mensual, x="mes_anio", y="engagement_promedio",
+                labels={"mes_anio": "Mes", "engagement_promedio": "Engagement (%)"},
+                title="Engagement promedio por mes",
+            )
+            st.plotly_chart(fig_mes_eng, width="stretch")
+
+        st.dataframe(resumen_mensual, width="stretch")
+
+    st.divider()
+
+    # ---- Mejor y peor racha (rolling window de 3 publicaciones) ----
+    st.subheader("🔥 Mejor y peor racha")
+    VENTANA = 3
+    if len(df_filtrado) < VENTANA:
+        st.info(f"Se necesitan al menos {VENTANA} publicaciones para detectar rachas. Tienes {len(df_filtrado)}.")
+    else:
+        df_ordenado = df_filtrado.sort_values("timestamp_publicacion").reset_index(drop=True)
+        df_ordenado["racha_engagement"] = df_ordenado["engagement_rate_pct"].rolling(VENTANA).mean()
+
+        idx_mejor = df_ordenado["racha_engagement"].idxmax()
+        idx_peor = df_ordenado["racha_engagement"].idxmin()
+
+        col_mejor, col_peor = st.columns(2)
+        with col_mejor:
+            st.markdown(f"**🏆 Mejor racha** ({VENTANA} publicaciones consecutivas)")
+            racha_mejor = df_ordenado.iloc[idx_mejor - VENTANA + 1: idx_mejor + 1]
+            st.metric("Engagement promedio de la racha", f"{df_ordenado.loc[idx_mejor, 'racha_engagement']:.2f}%")
+            st.dataframe(
+                racha_mejor[["timestamp_publicacion", "media_type", "engagement_rate_pct", "permalink"]],
+                width="stretch",
+            )
+        with col_peor:
+            st.markdown(f"**📉 Peor racha** ({VENTANA} publicaciones consecutivas)")
+            racha_peor = df_ordenado.iloc[idx_peor - VENTANA + 1: idx_peor + 1]
+            st.metric("Engagement promedio de la racha", f"{df_ordenado.loc[idx_peor, 'racha_engagement']:.2f}%")
+            st.dataframe(
+                racha_peor[["timestamp_publicacion", "media_type", "engagement_rate_pct", "permalink"]],
+                width="stretch",
+            )
 
     st.divider()
 
@@ -547,4 +782,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
